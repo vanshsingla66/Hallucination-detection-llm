@@ -1,0 +1,28 @@
+
+# Core ML — Ollama is used for generation (see APP_SETUP.md).
+# The transformers library is still needed for the NLI verifier (mDeBERTa)
+# and as a fallback generator when Ollama is not running.
+#
+# IMPORTANT: transformers must be <= 4.46.x for PyTorch 2.2.x compatibility.
+# transformers >= 5.x requires PyTorch >= 2.6 and will break the NLI verifier.
+torch
+"transformers>=4.44.2,<5.0"
+accelerate          # efficient model loading (optional but recommended)
+sentence-transformers  # semantic reranker (EvidenceReranker)
+
+# Retrieval / search
+numpy
+rank-bm25
+huggingface-hub
+datasets
+faiss-cpu
+pyserini            # BM25 retrieval for MIRACL corpora
+regex
+sentencepiece       # multilingual tokenizers
+
+# Web evidence (optional — requires a Tavily API key)
+requests            # web_search_retriever.py and runtime web calls
+python-dotenv       # load .env for TAVILY_API_KEY
+
+# UI
+streamlit
