@@ -72,19 +72,26 @@ def _summarize_verdicts(verified_claims: list[dict]) -> dict:
     return counts
 
 
-def _has_tavily_key() -> bool:
-    return bool(os.environ.get("TAVILY_API_KEY", "").strip())
+def _source_name(source: str) -> str:
+    return "Tavily Web" if source == "web" else source.upper()
+
+
+def _clear_verification() -> None:
+    st.session_state.pop("verified_result", None)
 
 
 def _clear_results() -> None:
     st.session_state.pop("latest_result", None)
-    st.session_state.pop("verified_result", None)
+    _clear_verification()
 
 
-# Discard results left in a connected session by the earlier extractor.
-_CLAIM_RESULTS_VERSION = 4
+# Discard results produced by older versions of the pipeline.
+_CLAIM_RESULTS_VERSION = 5
 if st.session_state.get("claim_results_version") != _CLAIM_RESULTS_VERSION:
-    _clear_results()
+    if st.session_state.get("claim_results_version") == 4:
+        _clear_verification()
+    else:
+        _clear_results()
     st.session_state["claim_results_version"] = _CLAIM_RESULTS_VERSION
 
 
@@ -110,23 +117,21 @@ with st.sidebar:
     st.divider()
     st.subheader("🔑 Evidence Retrieval Sources")
     st.markdown(
-        "- **Primary**: Local MIRACL / corpus datasets (`en`, `hi`, `bn`, `mr`)\n"
-        "- **Fallback**: Tavily Web Search (optional)"
+        "- Local corpus: MIRACL (`en`, `hi`, `bn`) and Marathi datasets (`mr`)\n"
+        "- Tavily Web Search for every claim when a key is set"
     )
-    st.caption("Local retrieval runs offline without any API key.")
     tavily_input = st.text_input(
-        "Tavily API Key (Optional Fallback)",
-        value=os.environ.get("TAVILY_API_KEY", ""),
+        "Tavily API key",
         type="password",
         placeholder="tvly-…",
+        on_change=_clear_verification,
     )
-    if tavily_input:
-        os.environ["TAVILY_API_KEY"] = tavily_input
+    tavily_key = tavily_input.strip() or os.environ.get("TAVILY_API_KEY", "").strip()
 
-    if _has_tavily_key():
-        st.success("Tavily key set — web search fallback enabled.")
+    if tavily_key:
+        st.success("Verification will search Tavily and the available local corpus.")
     else:
-        st.info("Local MIRACL retrieval active. (No web fallback key set).")
+        st.info("Verification will use the available local corpus only.")
 
     st.divider()
     st.caption(
@@ -250,7 +255,7 @@ if result:
             try:
                 with st.spinner("Running NLI verification…"):
                     verified = run_verification_pipeline(
-                        result, progress_callback=_progress
+                        result, progress_callback=_progress, tavily_api_key=tavily_key,
                     )
                 st.session_state["verified_result"] = verified
                 progress_bar.empty()
@@ -281,11 +286,14 @@ if verified_result:
     for vc in verified_claims:
         for ev in vc.get("evidence", []):
             if ev.get("source"):
-                retrieval_sources.add(str(ev["source"]).upper())
+                retrieval_sources.add(_source_name(ev["source"]))
     if retrieval_sources:
         st.success(f"Evidence retrieved from: {', '.join(sorted(retrieval_sources))}")
-    elif not _has_tavily_key():
-        st.info("ℹ️ Local retrieval found no matching passages in the local dataset for these claims. (Optional: add a Tavily API key in the sidebar for web search fallback).")
+    else:
+        st.info("No evidence passages were available for these claims.")
+    for vc in verified_claims:
+        for warning in vc.get("retrieval_warnings", []):
+            st.warning(f"Claim {vc['claim_id']}: {warning}")
 
     st.divider()
 
@@ -320,7 +328,7 @@ if verified_result:
             best_ev = vc.get("best_evidence")
             if best_ev:
                 with st.container(border=True):
-                    source_name = str(best_ev.get("source", "miracl")).upper()
+                    source_name = _source_name(best_ev.get("source", "miracl"))
                     docid = best_ev.get("docid", "")
                     docid_badge = f" (DocID: `{docid}`)" if docid else ""
                     st.caption(f"📄 Best matching evidence — **Source: {source_name}**{docid_badge}")
@@ -349,7 +357,7 @@ if verified_result:
             if len(all_ev) > 1:
                 with st.expander(f"All {len(all_ev)} evidence passages"):
                     for ev in all_ev:
-                        src = str(ev.get("source", "miracl")).upper()
+                        src = _source_name(ev.get("source", "miracl"))
                         docid_txt = f" | DocID: `{ev.get('docid')}`" if ev.get("docid") else ""
                         st.caption(
                             f"**{ev.get('title', 'Untitled')}** ({src}{docid_txt})"
@@ -359,4 +367,6 @@ if verified_result:
                             if len(ev.get("text", "")) > 350
                             else ev.get("text", "")
                         )
+                        if ev.get("url"):
+                            st.markdown(f"[Source URL ↗]({ev['url']})")
                         st.divider()

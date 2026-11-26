@@ -10,7 +10,7 @@ The application provides an end-to-end hallucination detection and claim verific
 ### Downstream Verification Pipeline
 - **Claim Extraction (`src/claims/`)**: 2-pass high-recall atomic claim extraction with format robustness and completeness audit. Supports multilingual queries (`en`, `hi`, `mr`, `bn`, `ta`, `te`).
 - **Evidence Retrieval & Reranking (`src/retrieval/`)**:
-  - Live Web evidence retrieval using Tavily API (optional, set `TAVILY_API_KEY` in UI sidebar or `.env`).
+  - Each claim is searched in the local corpus for its language. With a Tavily API key, verification also uses web passages and their source links.
   - Semantic evidence reranking using `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`.
 - **NLI Claim Verification (`src/verification/`)**:
   - Cross-lingual NLI using `MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7`.
@@ -57,10 +57,12 @@ streamlit run app.py
 ```
 Open your browser at `http://localhost:8501`.
 
-### Optional: Live Web Evidence Retrieval
-In the sidebar of the Streamlit interface, paste your **Tavily API key** or set it in your environment:
+### Evidence sources
+Without a key, verification uses the available local dataset (MIRACL for English, Hindi, and Bengali, and the configured Marathi corpus for Marathi). To search Tavily as well for every claim, enter your key in the sidebar or set `TAVILY_API_KEY` in the project's `.env` file or environment before starting Streamlit.
 ```bash
 export TAVILY_API_KEY="your-api-key"
 ```
-Without an API key, the system runs local NLI verification on any supplied or cached evidence and marks unretrieved claims as `unsupported` with zero errors.
+Click **Verify claims with evidence** to search. If a source fails, the app shows a message and uses the evidence that the other source returned.
+
+If verification shows `unexpected keyword argument 'tavily_api_key'` after a code update, the running server still has the previous verification function in memory. Click **Rerun** in Streamlit and retry verification. If the same error persists, restart the app from the project root with `streamlit run app.py` after stopping the previous server with Ctrl+C.
 

@@ -3,7 +3,7 @@
 Both modes (AI-generated and user-provided) run through the same downstream
 pipeline:
   1. Claim extraction  (LLM-based, 2-pass)
-  2. Evidence retrieval  (Tavily web search + semantic reranking)
+  2. Evidence retrieval  (local corpus plus Tavily when a key is configured)
   3. NLI verification  (mDeBERTa multilingual)
   4. Confidence scoring and explanation generation
 
@@ -15,6 +15,10 @@ run_verification_pipeline(result)         -> dict  (stage: "complete")
 run_full_pipeline(question, language, answer=None) -> dict
 """
 import os
+from pathlib import Path
+
+import requests
+from dotenv import load_dotenv
 
 from src.claims.extractor import extract_claims
 from src.explanation.confidence import calculate_confidence, generate_explanation
@@ -23,8 +27,7 @@ from src.verification.verifier import verify_claim as _nli_verify_claim
 
 SUPPORTED_LANGUAGES = LANGUAGE_NAMES
 
-# Tavily API key — set via env var or .env file.
-_TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
+load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=False)
 
 # Cached singleton retriever and reranker instances
 _LOCAL_RETRIEVERS: dict = {}
@@ -91,47 +94,23 @@ def _get_reranker():
     return _RERANKER_INSTANCE if _RERANKER_INSTANCE is not False else None
 
 
-def _retrieve_web_evidence(claim: str, top_k: int = 5) -> list[dict]:
-    """Retrieve evidence for a single claim via Tavily web search.
-
-    Returns an empty list when the API key is missing or the request fails,
-    so the pipeline always continues.
-    """
-    api_key = os.environ.get("TAVILY_API_KEY", "").strip() or _TAVILY_API_KEY
-    if not api_key:
-        return []
-
-    import urllib.request
-    import urllib.error
-    import json
-
-    payload = json.dumps({
-        "api_key": api_key,
-        "query": claim,
-        "search_depth": "basic",
-        "max_results": top_k,
-    }).encode()
-
-    req = urllib.request.Request(
+def _retrieve_web_evidence(claim: str, api_key: str, top_k: int) -> list[dict]:
+    """Look up this claim with Tavily and keep the source links for verification."""
+    response = requests.post(
         "https://api.tavily.com/search",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
+        json={"query": claim, "search_depth": "basic", "max_results": min(top_k, 20)},
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=30,
     )
-
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            results = json.loads(resp.read()).get("results", [])
-    except Exception as exc:
-        print(f"[orchestrator] Web search request failed: {exc}")
-        return []
+    response.raise_for_status()
+    results = response.json()["results"]
 
     passages = []
     for rank, r in enumerate(results, start=1):
         text = (r.get("content") or "").strip()
         url = r.get("url", "")
         title = r.get("title", "")
-        if not text:
+        if not text or not url:
             continue
         passages.append({
             "docid": f"web_{rank}",
@@ -140,7 +119,7 @@ def _retrieve_web_evidence(claim: str, top_k: int = 5) -> list[dict]:
             "url": url,
             "source": "web",
             "rank": rank,
-            "relevance_score": float(r.get("score", 0.0)),
+            "relevance_score": float(r.get("score") or 0.0),
             "rerank_score": None,
         })
     return passages
@@ -155,7 +134,7 @@ def _rerank_evidence(claim: str, passages: list[dict], top_k: int = 5) -> list[d
         try:
             return reranker.rerank(claim, passages, top_k=top_k)
         except Exception as exc:
-            print(f"[orchestrator] Reranking failed, using BM25 rank: {exc}")
+            print(f"[orchestrator] Reranking failed, keeping source order: {exc}")
     return passages[:top_k]
 
 
@@ -163,48 +142,59 @@ def retrieve_evidence_for_claim(
     claim: str,
     language: str = "en",
     top_k: int = 5,
+    *,
+    tavily_api_key: str | None = None,
+    on_warning=print,
 ) -> list[dict]:
-    """Retrieve evidence for a single claim.
-
-    Strategy:
-      1. Retrieve local MIRACL / corpus evidence for the selected language.
-      2. Rerank local candidates using the multilingual semantic reranker.
-      3. If local retrieval returns no evidence and Tavily is configured,
-         fall back to web search.
-      4. If both sources yield no evidence, returns an empty list without
-         crashing, allowing NLI to record 'Not Enough Evidence'.
-    """
+    """Return up to top_k passages per source. An explicit empty key selects local only."""
+    if top_k <= 0:
+        return []
     language = (language or "en").lower().strip()
+    if tavily_api_key is None:
+        tavily_api_key = os.environ.get("TAVILY_API_KEY", "")
+    tavily_api_key = tavily_api_key.strip()
     local_passages = []
-
-    # 1. Local retrieval
-    retriever = get_local_retriever(language)
-    if retriever is not None:
-        try:
-            candidate_k = 50 if language == "en" else 200
-            candidates = retriever.retrieve(claim, top_k=candidate_k)
-            if candidates:
-                source_label = "vaarta" if language == "mr" else "miracl"
-                for c in candidates:
-                    if not c.get("source"):
-                        c["source"] = source_label
+    try:
+        retriever = get_local_retriever(language)
+        if retriever is not None:
+            if language == "mr":
+                # Vaarta already reranks its own candidates.
+                local_passages = retriever.retrieve(claim, final_top_k=top_k)
+            else:
+                candidate_k = 50 if language == "en" else 200
+                candidates = retriever.retrieve(claim, top_k=candidate_k)
                 local_passages = _rerank_evidence(claim, candidates, top_k=top_k)
-        except Exception as exc:
-            print(f"[orchestrator] Local retriever error for '{language}': {exc}")
-            raise RuntimeError(f"Local {language.upper()} retrieval failed: {exc}") from exc
+            for passage in local_passages:
+                if not passage.get("source"):
+                    passage["source"] = "vaarta" if language == "mr" else "miracl"
+    except Exception as exc:
+        on_warning(f"Local {language.upper()} retrieval failed: {exc}")
 
-    if local_passages:
+    if not tavily_api_key:
         return local_passages
 
-    # 2. Fallback to Tavily web search if local retrieval found nothing
-    tavily_key = os.environ.get("TAVILY_API_KEY", "").strip() or _TAVILY_API_KEY
-    if tavily_key:
-        print(f"[orchestrator] Local retrieval returned no passages; attempting Tavily fallback...")
-        web_passages = _retrieve_web_evidence(claim, top_k=top_k)
+    try:
+        web_passages = _retrieve_web_evidence(claim, tavily_api_key, top_k)
+    except requests.HTTPError as exc:
+        status = exc.response.status_code
+        message = {
+            401: "Check the API key.",
+            403: "Check the key's access permissions.",
+            429: "Too many requests. Try again later.",
+            432: "Check your Tavily usage limit.",
+            433: "Check your Tavily spending limit.",
+        }.get(status, "Try again later.")
+        on_warning(f"Tavily search failed (HTTP {status}). {message}")
+    except requests.exceptions.SSLError:
+        on_warning("Tavily search failed because the server's HTTPS certificate could not be verified.")
+    except Exception:
+        # Request errors can include the Authorization header. Keep credentials out of the UI.
+        on_warning("Tavily search failed. Check the connection and try again.")
+    else:
         if web_passages:
-            return _rerank_evidence(claim, web_passages, top_k=top_k)
-
-    return []
+            return local_passages + _rerank_evidence(claim, web_passages, top_k=top_k)
+        on_warning("Tavily searched the web and returned no passages for this claim.")
+    return local_passages
 
 
 def _verify_one_claim(claim_text: str, evidence: list[dict]) -> dict:
@@ -292,6 +282,8 @@ def prepare_manual_answer(question: str, answer: str, language: str = "en") -> d
 def run_verification_pipeline(
     result: dict,
     progress_callback=None,
+    *,
+    tavily_api_key: str | None = None,
 ) -> dict:
     """Take a 'claims_extracted' result dict and run the full downstream pipeline.
 
@@ -300,8 +292,10 @@ def run_verification_pipeline(
     result : dict
         Output of prepare_ai_answer() or prepare_manual_answer().
     progress_callback : callable, optional
-        Called with (current: int, total: int, claim_text: str) after each
-        claim is processed — useful for Streamlit progress bars.
+        Called before each claim and once at completion.
+    tavily_api_key : str, optional
+        Session key for web search alongside the local corpus. An empty string
+        selects local retrieval only. Omit the key to use TAVILY_API_KEY.
 
     Returns
     -------
@@ -319,8 +313,11 @@ def run_verification_pipeline(
         if progress_callback:
             progress_callback(i, len(claims), claim_text)
 
-        # Retrieve local evidence first (MIRACL/corpus), with optional web fallback.
-        passages = retrieve_evidence_for_claim(claim_text, language=language)
+        retrieval_warnings = []
+        passages = retrieve_evidence_for_claim(
+            claim_text, language=language, tavily_api_key=tavily_api_key,
+            on_warning=retrieval_warnings.append,
+        )
 
         # NLI verification + confidence/explanation.
         verification = _verify_one_claim(claim_text, passages)
@@ -329,6 +326,7 @@ def run_verification_pipeline(
             "claim_id": claim_item["claim_id"],
             "claim": claim_text,
             "evidence": passages,
+            "retrieval_warnings": retrieval_warnings,
             **verification,
         })
 
@@ -351,6 +349,8 @@ def run_full_pipeline(
     language: str = "en",
     answer: str | None = None,
     progress_callback=None,
+    *,
+    tavily_api_key: str | None = None,
 ) -> dict:
     """End-to-end pipeline.
 
@@ -362,4 +362,6 @@ def run_full_pipeline(
     else:
         result = prepare_ai_answer(question, language)
 
-    return run_verification_pipeline(result, progress_callback=progress_callback)
+    return run_verification_pipeline(
+        result, progress_callback=progress_callback, tavily_api_key=tavily_api_key,
+    )
