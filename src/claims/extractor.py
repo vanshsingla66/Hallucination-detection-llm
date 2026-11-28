@@ -4,6 +4,7 @@ import json
 import re
 
 from src.generation.llm import LANGUAGE_NAMES, generate_claim_json
+from src.verification.officeholders import current_office_claim
 
 
 # Consume quoted or parenthesized text as a unit, so embedded punctuation
@@ -23,9 +24,20 @@ _SPLIT_SCOPE = re.compile(
     re.IGNORECASE,
 )
 _END_MARKS = ".।॥!"
+_SIMPLE_ASSERTION = re.compile(
+    r"^(?:[\w'-]+ ){1,10}(?:is|are|was|were|has|have|had) \S", re.I,
+)
+_NON_ASSERTION = re.compile(
+    r"^(?:please|tell|show|check|verify|find|explain|let|suppose|imagine|if|whether|"
+    r"who|what|which|when|where|why|how|is|are|was|were|i|we|you)\b", re.I,
+)
+_QUALIFIED_ASSERTION = re.compile(r'["“”]|\b(?:if|unless|may|might|could|said|claimed|reported)\b', re.I)
 
 _SELECTION_SYSTEM = (
-    "Find complete factual sentences. A city, person, or other name alone "
+    "Select statements that make a checkable assertion. Do not judge whether "
+    "they are true, plausible, or well written. Keep false statements and "
+    "informal wording, abbreviations, and lowercase names. For example, "
+    "'the moon is made of cheese' makes a checkable assertion. A city, person, or other name alone "
     "is a fragment, not a sentence. When the input contains no assertion "
     'output {"claims":[]}. Otherwise list factual sentence IDs under claims. '
     "Select checkable assertions even if they might be false. "
@@ -152,6 +164,11 @@ def extract_claims(answer: str, language: str = "en") -> list[dict]:
     if not source:
         return []
 
+    if len(source) == 1:
+        sentence, = source.values()
+        if current_office_claim(sentence):
+            return [{"claim_id": 1, "claim": sentence}]
+
     for attempt in range(2):
         try:
             selected_ids = _select_ids(source, language)
@@ -167,6 +184,16 @@ def extract_claims(answer: str, language: str = "en") -> list[dict]:
             selected_ids.update(_select_ids(uncovered, language, existing=existing))
         except (ValueError, RuntimeError, OSError) as exc:
             print(f"WARNING: Completeness audit failed; returning initial claims. Details: {exc}")
+
+    # A model can drop an obviously false or awkwardly worded statement.
+    # Keep clear English assertions verbatim so the verifier can examine them.
+    if language == "en":
+        selected_ids.update(
+            key for key, sentence in uncovered.items()
+            if current_office_claim(sentence)
+            or (_SIMPLE_ASSERTION.match(sentence) and not _NON_ASSERTION.match(sentence)
+                and not _QUALIFIED_ASSERTION.search(sentence))
+        )
 
     # The model selects sentence IDs and can authorize a split at an existing
     # conjunction. Claim text always comes from the current answer.

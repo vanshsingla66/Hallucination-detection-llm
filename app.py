@@ -73,7 +73,7 @@ def _summarize_verdicts(verified_claims: list[dict]) -> dict:
 
 
 def _source_name(source: str) -> str:
-    return "Tavily Web" if source == "web" else source.upper()
+    return {"web": "Tavily Web", "official": "Official PMO profile"}.get(source, source.upper())
 
 
 def _clear_verification() -> None:
@@ -86,12 +86,9 @@ def _clear_results() -> None:
 
 
 # Discard results produced by older versions of the pipeline.
-_CLAIM_RESULTS_VERSION = 5
+_CLAIM_RESULTS_VERSION = 8
 if st.session_state.get("claim_results_version") != _CLAIM_RESULTS_VERSION:
-    if st.session_state.get("claim_results_version") == 4:
-        _clear_verification()
-    else:
-        _clear_results()
+    _clear_results()
     st.session_state["claim_results_version"] = _CLAIM_RESULTS_VERSION
 
 
@@ -129,7 +126,8 @@ with st.sidebar:
     tavily_key = tavily_input.strip() or os.environ.get("TAVILY_API_KEY", "").strip()
 
     if tavily_key:
-        st.success("Verification will search Tavily and the available local corpus.")
+        st.success("Verification will search Tavily and the available local corpus. "
+                   "For current India PM claims, it also checks the official PMO profile.")
     else:
         st.info("Verification will use the available local corpus only.")
 
@@ -146,7 +144,7 @@ with st.sidebar:
 st.title("🔎 Hallucination Detection System")
 st.caption(
     "Generate or submit an answer, extract factual claims, retrieve evidence, "
-    "and get an NLI-based verdict for each claim."
+    "and see which passages support or contradict each claim."
 )
 
 # ---------------------------------------------------------------------------
@@ -234,7 +232,7 @@ if result:
         for c in result["claims"]:
             st.markdown(f"**{c['claim_id']}.** {c['claim']}")
     else:
-        st.warning("No claims were extracted. Try a more factual answer.")
+        st.warning("The extractor found no checkable statements. Try a complete statement you want to verify.")
 
     # --- Verify button ---
     verified_result = st.session_state.get("verified_result")
@@ -253,7 +251,7 @@ if result:
                 status_text.caption(label)
 
             try:
-                with st.spinner("Running NLI verification…"):
+                with st.spinner("Checking claims against the retrieved passages…"):
                     verified = run_verification_pipeline(
                         result, progress_callback=_progress, tavily_api_key=tavily_key,
                     )
@@ -312,10 +310,13 @@ if verified_result:
             expanded=(label == "contradicted"),
         ):
             st.markdown(f"**Verdict:** {_verdict_badge(label)}")
-            st.markdown(
-                f"**Support score:** `{sup:.3f}`   "
-                f"**Contradiction score:** `{con:.3f}`"
-            )
+            if vc.get("verification_claim", vc["claim"]) != vc["claim"]:
+                st.caption(f"Interpreted from your question as “{vc['verification_claim']}”")
+            if vc.get("decision_method") != "officeholder":
+                st.markdown(
+                    f"**Support score:** `{sup:.3f}`   "
+                    f"**Contradiction score:** `{con:.3f}`"
+                )
 
             if vc.get("summary"):
                 st.markdown(f"**Explanation:** {vc['summary']}")
@@ -334,12 +335,15 @@ if verified_result:
                     st.caption(f"📄 Best matching evidence — **Source: {source_name}**{docid_badge}")
                     if best_ev.get("title"):
                         st.markdown(f"**{best_ev['title']}**")
-                    ev_text = best_ev.get("text", "")
-                    st.write(ev_text[:600] + "…" if len(ev_text) > 600 else ev_text)
+                    if vc.get("evidence_quote"):
+                        st.text(vc["evidence_quote"])
+                    else:
+                        ev_text = best_ev.get("text", "")
+                        st.write(ev_text[:600] + "…" if len(ev_text) > 600 else ev_text)
                     if best_ev.get("url"):
                         st.markdown(f"[Source URL ↗]({best_ev['url']})")
-            else:
-                st.caption("No evidence passage retrieved for this claim.")
+            elif vc.get("evidence"):
+                st.caption("The retrieved passages do not establish a verdict.")
 
             # If both support and contradiction are notable, surface the contradicting passage explicitly
             strongest_con = vc.get("strongest_contradicting_passage")
@@ -354,7 +358,7 @@ if verified_result:
 
             # All evidence passages (collapsed)
             all_ev = vc.get("evidence", [])
-            if len(all_ev) > 1:
+            if all_ev and (len(all_ev) > 1 or not best_ev):
                 with st.expander(f"All {len(all_ev)} evidence passages"):
                     for ev in all_ev:
                         src = _source_name(ev.get("source", "miracl"))

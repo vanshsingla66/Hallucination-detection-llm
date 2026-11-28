@@ -19,11 +19,10 @@ What this connector does
   * Prepends the passage title ("Title: text") for context.
   * Splits LONG passages (web pages can be 8,000 characters) into sentence-based
     chunks of at most MAX_CHARS, because the NLI model only reads ~512 tokens and
-    would otherwise never see the relevant sentence. Each chunk is scored on its own
-    and the strongest entailment / contradiction over all chunks decides the label.
+    would otherwise never see the relevant sentence. The shared verifier checks
+    the evidence before assigning a label.
   * Keeps the source type (miracl / web_search / ...) so results can be reported per source.
 
-verifier.py is NOT modified: this file uses its public nli_scores() and aggregate().
 """
 
 import json
@@ -31,7 +30,8 @@ import re
 from collections import Counter
 from pathlib import Path
 
-from src.verification.verifier import nli_scores, aggregate
+from src.verification.officeholders import current_office_claim
+from src.verification.verifier import nli_scores, verify_claim
 
 EVIDENCE_FILE = Path("data/processed/evidence.json")
 VERIFICATION_FILE = Path("data/processed/verification.json")
@@ -101,13 +101,13 @@ def to_verifier_passages(item):
 
 def verify_item(item, scorer=nli_scores):
     """Verify one claim against its retrieved passages."""
-    passage_results = []
-    for passage in to_verifier_passages(item):
-        passage_results.append(
-            {"evidence": passage, "scores": scorer(passage["text"], item["claim"])}
-        )
-
-    decision = aggregate(passage_results)
+    if current_office_claim(item["claim"]):
+        # An office directory can identify a person across adjacent lines.
+        passages = [{**p, "source_type": p.get("source") or "miracl", "chunk": 0}
+                    for p in item.get("evidence", [])]
+    else:
+        passages = to_verifier_passages(item)
+    decision = verify_claim(item["claim"], passages, scorer=scorer, confirm_contradictions=True)
 
     return {
         "sample_id": item.get("sample_id"),
@@ -115,25 +115,15 @@ def verify_item(item, scorer=nli_scores):
         "claim": item["claim"],
         "language": item.get("language"),
         "retrieval_status": item.get("retrieval_status"),
-        "label": decision["label"],
-        "support_score": decision["support_score"],
-        "contradict_score": decision["contradict_score"],
-        "best_evidence": decision["best_evidence"],
-        "reason": decision.get("reason"),
+        **decision,
         "num_passages": len(item.get("evidence", [])),
-        "num_chunks_scored": len(passage_results),
+        "num_chunks_scored": decision["num_passages"],
         "passage_scores": [
             {
-                "docid": r["evidence"]["docid"],
-                "chunk": r["evidence"]["chunk"],
-                "source_type": r["evidence"]["source_type"],
-                "rank": r["evidence"]["rank"],
-                "title": r["evidence"]["title"],
-                "url": r["evidence"]["url"],
-                "text_preview": r["evidence"]["text"][:PREVIEW_CHARS],
-                **r["scores"],
+                **r,
+                "text_preview": r["text"][:PREVIEW_CHARS],
             }
-            for r in passage_results
+            for r in decision["passage_scores"]
         ],
     }
 

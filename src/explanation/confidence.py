@@ -6,12 +6,18 @@ from collections import Counter
 THRESHOLD = 0.5
 
 
-def calculate_confidence(support_score, contradict_score):
+def calculate_confidence(support_score, contradict_score, *, decision_method="nli", label=None):
     """
     Summarize support and contradiction scores.
     This is a heuristic assessment, not a calibrated probability.
     """
 
+    if decision_method == "officeholder":
+        return {
+            "score_balance": None,
+            "status": "direct_evidence" if label in {"supported", "contradicted"} else "insufficient_data",
+            "interpretation": "",
+        }
     if support_score is None or contradict_score is None:
         return {
             "score_balance": None,
@@ -19,7 +25,7 @@ def calculate_confidence(support_score, contradict_score):
             "interpretation": "One or both scores are missing."
         }
 
-    if support_score >= THRESHOLD and contradict_score >= THRESHOLD:
+    if support_score >= THRESHOLD and (contradict_score >= THRESHOLD or label == "unsupported"):
         return {
             "score_balance": round(
                 abs(support_score - contradict_score), 3
@@ -39,6 +45,13 @@ def calculate_confidence(support_score, contradict_score):
                 "The support score reaches the threshold, "
                 "while the contradiction score does not."
             )
+        }
+
+    if label == "contradicted" and contradict_score < THRESHOLD:
+        return {
+            "score_balance": round(contradict_score, 3),
+            "status": "contradiction_dominant",
+            "interpretation": "The cited passage states a fact that conflicts with the claim.",
         }
 
     if contradict_score >= THRESHOLD:
@@ -90,19 +103,21 @@ def generate_explanation(record):
         default=None
     )
 
-    if support_score is None or contradict_score is None:
+    if record.get("decision_method") == "officeholder":
+        summary = record["reason"]
+        strongest_support = best_evidence if label == "supported" else None
+        strongest_contradiction = best_evidence if label == "contradicted" else None
+    elif support_score is None or contradict_score is None:
         summary = (
             "Insufficient score information to assess this claim."
         )
-    elif (
-        support_score >= THRESHOLD
-        and contradict_score >= THRESHOLD
-    ):
+    elif support_score >= THRESHOLD and (contradict_score >= THRESHOLD or label == "unsupported"):
         summary = (
-            "Both support and contradiction scores are high. "
-            "Inspect the passages to determine whether they address "
-            "the same fact and genuinely conflict."
+            "The evidence includes passages that support the claim and passages "
+            "that contradict it. The conflict prevents a definitive verdict."
         )
+    elif label == "contradicted" and record.get("evidence_quote"):
+        summary = "The cited passage directly contradicts the claim."
     elif support_score >= THRESHOLD:
         summary = (
             "The retrieved evidence provides support for this claim."
@@ -139,7 +154,8 @@ def main():
     for record in data:
         confidence_result = calculate_confidence(
             record.get("support_score"),
-            record.get("contradict_score")
+            record.get("contradict_score"),
+            decision_method=record.get("decision_method", "nli"), label=record["label"],
         )
 
         explanation_result = generate_explanation(record)

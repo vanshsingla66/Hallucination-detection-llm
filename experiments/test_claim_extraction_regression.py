@@ -20,6 +20,22 @@ def selection(*items):
 
 
 class ClaimExtractionTests(unittest.TestCase):
+    def test_retains_false_statements_regardless_of_word_order_or_topic(self):
+        cases = (
+            "cm of up is narendra modi.",
+            "narendra modi is cm of up.",
+            "Narendra Modi is the pm of pakistan.",
+            "the moon is made of cheese.",
+            "The Earth is not round.",
+            "Sydney is the capital of Australia.",
+        )
+        with patch("src.claims.extractor.generate_claim_json", return_value=selection()):
+            for answer in cases:
+                with self.subTest(answer=answer):
+                    self.assertEqual(extract_claims(answer), [{"claim_id": 1, "claim": answer}])
+            self.assertEqual(extract_claims("Is the Moon made of cheese?"), [])
+            self.assertEqual(extract_claims("Sydney"), [])
+
     def test_model_cannot_add_unsupported_text_in_either_pass(self):
         invented = {"source_id": 1, "claim": "नई दिल्ली में ताज महल है।"}
         with patch("src.claims.extractor.generate_claim_json", side_effect=[
@@ -88,18 +104,17 @@ class VerificationRegressionTests(unittest.TestCase):
             {"title": "Chile", "text": "The flag of Chile has two horizontal bands."},
         ]
         high = {"entailment": 0.01, "neutral": 0.01, "contradiction": 0.98}
-        weak_reverse = {"entailment": 0.10, "neutral": 0.50, "contradiction": 0.40}
         prepared = {"language": "en", "claims": [{"claim_id": 1, "claim": FLAG_ANSWER}]}
         with (
             patch.object(orchestrator, "retrieve_evidence_for_claim", return_value=evidence),
-            patch.object(verifier, "nli_scores", side_effect=[high, weak_reverse, high, high]),
+            patch.object(verifier, "nli_scores", return_value=high),
             patch.object(
-                verifier, "generate_claim_json", return_value='{"about_same_subject": false}',
-            ) as check_subject,
+                verifier, "generate_claim_json", return_value='{"contradiction": false, "quote": ""}',
+            ) as check_evidence,
         ):
             result = orchestrator.run_verification_pipeline(prepared)
 
-        check_subject.assert_called_once()
+        self.assertEqual(check_evidence.call_count, 2)
         verified = result["verified_claims"][0]
         self.assertEqual(verified["label"], "unsupported")
         self.assertEqual(verified["contradict_score"], 0.0)
@@ -111,14 +126,14 @@ class VerificationRegressionTests(unittest.TestCase):
             patch.object(verifier, "nli_scores", return_value=high) as score,
             patch.object(
                 verifier, "generate_claim_json",
-                return_value='{"subject":"the national flag of India","about_same_subject":false}',
+                return_value=json.dumps({"contradiction": True, "quote": evidence[0]["text"]}),
             ),
         ):
             result = verifier.verify_claim(
                 "The national flag of India has no chakra.", evidence, confirm_contradictions=True,
             )
 
-        self.assertEqual(score.call_count, 2)
+        score.assert_called_once()
         self.assertEqual(result["label"], "contradicted")
         self.assertEqual(result["best_evidence"], evidence[0])
 
@@ -130,9 +145,7 @@ class VerificationRegressionTests(unittest.TestCase):
         high = {"entailment": 0.01, "neutral": 0.01, "contradiction": 0.98}
         with (
             patch.object(verifier, "nli_scores", return_value=high),
-            patch.object(verifier, "generate_claim_json", side_effect=[
-                '{"about_same_subject": true}', '{"contradiction": false}',
-            ]),
+            patch.object(verifier, "generate_claim_json", return_value='{"contradiction": false}'),
         ):
             result = verifier.verify_claim(claim, evidence, confirm_contradictions=True)
         self.assertEqual(result["label"], "unsupported")
